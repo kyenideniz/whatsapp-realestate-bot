@@ -1,7 +1,28 @@
 // app/api/whatsapp/route.js
+// app/api/whatsapp/route.js
 import { Twilio } from 'twilio';
 import { NextResponse } from 'next/server';
 import { listings } from '@/config/listings';
+
+// Track ongoing requests
+const requestStore = {
+  requests: new Map(),
+  lastId: 0,
+  addRequest(req) {
+    const id = ++this.lastId;
+    this.requests.set(id, {
+      id,
+      timestamp: new Date().toISOString(),
+      ...req,
+      status: 'processing'
+    });
+    return id;
+  },
+  updateRequest(id, updates) {
+    const req = this.requests.get(id);
+    if (req) this.requests.set(id, { ...req, ...updates });
+  }
+};
 
 const client = new Twilio(
   process.env.TWILIO_ACCOUNT_SID,
@@ -177,17 +198,72 @@ async function handleConversation(userInput, sender) {
   }
 }
 
+function generateHTML() {
+  const requests = Array.from(requestStore.requests.values()).reverse();
+  return `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>Active Requests</title>
+        <style>
+          body { font-family: monospace; padding: 20px; }
+          .request { margin: 10px; padding: 10px; border: 1px solid #ccc; }
+        </style>
+      </head>
+      <body>
+        <h1>Active Requests (${requests.length})</h1>
+        ${requests.map(req => `
+          <div class="request">
+            <div>ID: ${req.id}</div>
+            <div>Time: ${req.timestamp}</div>
+            <div>From: ${req.from}</div>
+            <div>Message: ${req.message}</div>
+            <div>Status: ${req.status}</div>
+            ${req.response ? `<div>Response: ${req.response}</div>` : ''}
+          </div>
+        `).join('')}
+      </body>
+    </html>
+  `;
+}
+
+export async function GET() {
+  return new Response(generateHTML(), {
+    headers: {
+      'Content-Type': 'text/html',
+      'Access-Control-Allow-Origin': '*'
+    }
+  });
+}
+
 export async function POST(request) {
+  const reqId = requestStore.addRequest({
+    method: 'POST',
+    path: '/api/whatsapp',
+    from: 'unknown',
+    message: 'pending'
+  });
+
   try {
     const formData = await request.formData();
-    const userInput = formData.get('Body');
+    const incomingMsg = formData.get('Body');
     const sender = formData.get('From');
 
-    if (!userInput || !sender) {
-      return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
+    requestStore.updateRequest(reqId, {
+      from: sender,
+      message: incomingMsg
+    });
+
+    if (!incomingMsg || !sender) {
+      requestStore.updateRequest(reqId, { status: 'invalid' });
+      return NextResponse.json(
+        { error: 'Invalid request body' },
+        { status: 400 }
+      );
     }
 
-    const responseText = await handleConversation(userInput, sender);
+    const responseText = await handleConversation(incomingMsg, sender);
     
     await client.messages.create({
       body: responseText,
@@ -195,20 +271,23 @@ export async function POST(request) {
       to: sender
     });
 
+    requestStore.updateRequest(reqId, {
+      status: 'completed',
+      response: responseText
+    });
+
     return new Response(null, { status: 200 });
 
   } catch (error) {
-    console.error('API Error:', error);
+    requestStore.updateRequest(reqId, {
+      status: 'error',
+      error: error.message
+    });
+    
+    console.error('Error:', error);
     return NextResponse.json(
       { error: 'Internal Server Error' },
       { status: 500 }
     );
   }
-}
-
-export async function GET() {
-  return NextResponse.json(
-    { error: 'Method not allowed' },
-    { status: 405 }
-  );
 }
