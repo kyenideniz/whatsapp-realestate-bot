@@ -3,14 +3,76 @@ import { Twilio } from 'twilio';
 import { NextResponse } from 'next/server';
 import { listings } from '@/config/listings';
 import Redis from 'ioredis';
-import Queue from 'bull';
-import { rateLimit } from 'express-rate-limit';
 
 // 1. Initialize Redis for sessions
 const redis = new Redis(process.env.REDIS_URL);
 
+const requestStore = {
+  add: async (request) => {
+    const id = Date.now();
+    const requestData = {
+      id,
+      timestamp: new Date().toISOString(),
+      ...request,
+      status: 'queued'
+    };
+    await redis.hset('active_requests', id, JSON.stringify(requestData));
+    return id;
+  },
+
+  update: async (id, updates) => {
+    const existing = await redis.hget('active_requests', id);
+    if (existing) {
+      const data = JSON.parse(existing);
+      await redis.hset('active_requests', id, JSON.stringify({ ...data, ...updates }));
+    }
+  },
+
+  getAll: async () => {
+    const requests = await redis.hgetall('active_requests');
+    return Object.values(requests).map(JSON.parse).reverse();
+  }
+};
+
 // 2. Message queue for async processing
-const messageQueue = new Queue('messages', process.env.REDIS_URL);
+async function addToQueue(payload) {
+  await redis.lpush('message:queue', JSON.stringify(payload));
+}
+
+async function processQueue() {
+  while (true) {
+    const [, message] = await redis.brpop('message:queue', 0);
+    if (message) {
+      try {
+        const { sender, message: text, id } = JSON.parse(message);
+        await requestStore.update(id, { status: 'processing' });
+        
+        const response = await handleConversation(text, sender);
+        await client.messages.create({
+          body: response,
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: sender
+        });
+        
+        await requestStore.update(id, { 
+          status: 'completed',
+          response: response
+        });
+      } catch (error) {
+        console.error('Queue processing error:', error);
+        await requestStore.update(id, { 
+          status: 'failed',
+          error: error.message
+        });
+      }
+    }
+  }
+}
+
+// Start queue processing in background
+if (process.env.NODE_ENV !== 'test') {
+  processQueue();
+}
 
 // 3. Preserve your original Twilio client
 const client = new Twilio(
@@ -288,8 +350,8 @@ async function handleConversation(userInput, sender) {
   }
 }
 
-function generateHTML() {
-  const requests = Array.from(requestStore.requests.values()).reverse();
+async function generateHTML() {
+  const requests = await requestStore.getAll();
   return `
     <!DOCTYPE html>
     <html>
@@ -299,6 +361,11 @@ function generateHTML() {
         <style>
           body { font-family: monospace; padding: 20px; }
           .request { margin: 10px; padding: 10px; border: 1px solid #ccc; }
+          .status { font-weight: bold; color: #666; }
+          .queued { color: blue; }
+          .processing { color: orange; }
+          .completed { color: green; }
+          .failed { color: red; }
         </style>
       </head>
       <body>
@@ -306,11 +373,12 @@ function generateHTML() {
         ${requests.map(req => `
           <div class="request">
             <div>ID: ${req.id}</div>
-            <div>Time: ${req.timestamp}</div>
-            <div>From: ${req.from}</div>
+            <div>Time: ${new Date(req.timestamp).toLocaleString()}</div>
+            <div>From: ${req.sender}</div>
             <div>Message: ${req.message}</div>
-            <div>Status: ${req.status}</div>
+            <div class="status ${req.status}">Status: ${req.status.toUpperCase()}</div>
             ${req.response ? `<div>Response: ${req.response}</div>` : ''}
+            ${req.error ? `<div class="error">Error: ${req.error}</div>` : ''}
           </div>
         `).join('')}
       </body>
@@ -334,22 +402,23 @@ const sessions = {
 };
 
 // 6. Add rate limiter middleware
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  keyGenerator: (req) => req.body.get('From')
-});
+async function rateLimitMiddleware(request) {
+  const sender = (await request.formData()).get('From');
+  const key = `rate_limit:${sender}`;
+  const current = await redis.incr(key);
+  
+  if (current > 100) {
+    await redis.expire(key, 900); // 15 minutes
+    return new Response('Too many requests', { status: 429 });
+  }
+  
+  if (current === 1) {
+    await redis.expire(key, 900);
+  }
+  
+  return null;
+}
 
-// 7. Queue processor (preserves your core logic)
-messageQueue.process(5, async (job) => {
-  const { sender, message } = job.data;
-  const response = await handleConversation(message, sender);
-  await client.messages.create({
-    body: response,
-    from: process.env.TWILIO_PHONE_NUMBER,
-    to: sender
-  });
-});
 
 // 8. Preserved GET endpoint
 export async function GET() {
@@ -363,15 +432,26 @@ export async function GET() {
 
 // 9. Enhanced POST endpoint
 export const POST = async (request) => {
+  const limitResponse = await rateLimitMiddleware(request);
+  if (limitResponse) return limitResponse;
+
   const formData = await request.formData();
   const sender = formData.get('From');
   const message = formData.get('Body');
-
-  // Add to queue instead of processing immediately
-  await messageQueue.add({ sender, message });
   
-  return NextResponse.json({ status: 'Processing your request...' });
-};
+  const requestId = await requestStore.add({
+    from: sender,
+    message: message
+  });
 
-// Apply rate limiter as middleware
-export const middleware = limiter;
+  await addToQueue({ 
+    sender, 
+    message,
+    id: requestId
+  });
+
+  return NextResponse.json({ 
+    status: 'Processing your request...',
+    requestId
+  });
+};
