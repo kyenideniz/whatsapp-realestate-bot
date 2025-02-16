@@ -2,35 +2,23 @@
 import { Twilio } from 'twilio';
 import { NextResponse } from 'next/server';
 import { listings } from '@/config/listings';
+import Redis from 'ioredis';
+import Queue from 'bull';
+import { rateLimit } from 'express-rate-limit';
 
-// Track ongoing requests
-const requestStore = {
-  requests: new Map(),
-  lastId: 0,
-  addRequest(req) {
-    const id = ++this.lastId;
-    this.requests.set(id, {
-      id,
-      timestamp: new Date().toISOString(),
-      ...req,
-      status: 'processing'
-    });
-    return id;
-  },
-  updateRequest(id, updates) {
-    const req = this.requests.get(id);
-    if (req) this.requests.set(id, { ...req, ...updates });
-  }
-};
+// 1. Initialize Redis for sessions
+const redis = new Redis(process.env.REDIS_URL);
 
+// 2. Message queue for async processing
+const messageQueue = new Queue('messages', process.env.REDIS_URL);
+
+// 3. Preserve your original Twilio client
 const client = new Twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// Session management
-const sessions = new Map();
-console.log(sessions);
+// 4. Keep your original functions exactly as they were
 async function detectIntent(userInput) {
   try {
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -330,6 +318,40 @@ function generateHTML() {
   `;
 }
 
+// 5. Add Redis session adapter (preserves session logic)
+const sessions = {
+  get: async (sender) => {
+    const data = await redis.hgetall(`session:${sender}`);
+    return data?.state ? data : null;
+  },
+  set: async (sender, session) => {
+    await redis.hmset(`session:${sender}`, session);
+    await redis.expire(`session:${sender}`, 86400); // 1 day TTL
+  },
+  delete: async (sender) => {
+    await redis.del(`session:${sender}`);
+  }
+};
+
+// 6. Add rate limiter middleware
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  keyGenerator: (req) => req.body.get('From')
+});
+
+// 7. Queue processor (preserves your core logic)
+messageQueue.process(5, async (job) => {
+  const { sender, message } = job.data;
+  const response = await handleConversation(message, sender);
+  await client.messages.create({
+    body: response,
+    from: process.env.TWILIO_PHONE_NUMBER,
+    to: sender
+  });
+});
+
+// 8. Preserved GET endpoint
 export async function GET() {
   return new Response(generateHTML(), {
     headers: {
@@ -339,57 +361,17 @@ export async function GET() {
   });
 }
 
-export async function POST(request) {
-  const reqId = requestStore.addRequest({
-    method: 'POST',
-    path: '/api/whatsapp',
-    from: 'unknown',
-    message: 'pending'
-  });
+// 9. Enhanced POST endpoint
+export const POST = async (request) => {
+  const formData = await request.formData();
+  const sender = formData.get('From');
+  const message = formData.get('Body');
 
-  try {
-    const formData = await request.formData();
-    const incomingMsg = formData.get('Body');
-    const sender = formData.get('From');
+  // Add to queue instead of processing immediately
+  await messageQueue.add({ sender, message });
+  
+  return NextResponse.json({ status: 'Processing your request...' });
+};
 
-    requestStore.updateRequest(reqId, {
-      from: sender,
-      message: incomingMsg
-    });
-
-    if (!incomingMsg || !sender) {
-      requestStore.updateRequest(reqId, { status: 'invalid' });
-      return NextResponse.json(
-        { error: 'Invalid request body' },
-        { status: 400 }
-      );
-    }
-
-    const responseText = await handleConversation(incomingMsg, sender);
-    
-    await client.messages.create({
-      body: responseText,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: sender
-    });
-
-    requestStore.updateRequest(reqId, {
-      status: 'completed',
-      response: responseText
-    });
-
-    return new Response(null, { status: 200 });
-
-  } catch (error) {
-    requestStore.updateRequest(reqId, {
-      status: 'error',
-      error: error.message
-    });
-    
-    console.error('Error:', error);
-    return NextResponse.json(
-      { error: 'Internal Server Error' },
-      { status: 500 }
-    );
-  }
-} 
+// Apply rate limiter as middleware
+export const middleware = limiter;
