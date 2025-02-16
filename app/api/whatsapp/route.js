@@ -55,7 +55,26 @@ async function parsePropertySelection(userInput) {
       })
     });
 
-    const responseText = (await response.json()).choices[0].message.content.trim();
+    // Check for HTTP errors
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error('API Error:', response.status, errorBody);
+      return null;
+    }
+
+    const responseData = await response.json();
+    
+    // Validate response structure
+    if (!responseData.choices || 
+        !Array.isArray(responseData.choices) || 
+        responseData.choices.length === 0 ||
+        !responseData.choices[0].message ||
+        !responseData.choices[0].message.content) {
+      console.error('Invalid API response structure:', responseData);
+      return null;
+    }
+
+    const responseText = responseData.choices[0].message.content.trim();
     return listings.some(p => p.code === responseText) ? responseText : null;
 
   } catch (error) {
@@ -89,7 +108,26 @@ async function parseTimeSelection(userInput, availableTimes) {
       })
     });
 
-    const responseTime = (await response.json()).choices[0].message.content.trim();
+    // Check for HTTP errors
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error('API Error:', response.status, errorBody);
+      return null;
+    }
+
+    const responseData = await response.json();
+    
+    // Validate response structure
+    if (!responseData.choices || 
+        !Array.isArray(responseData.choices) || 
+        responseData.choices.length === 0 ||
+        !responseData.choices[0].message ||
+        !responseData.choices[0].message.content) {
+      console.error('Invalid API response structure:', responseData);
+      return null;
+    }
+
+    const responseTime = responseData.choices[0].message.content.trim();
     return availableTimes.includes(responseTime) ? responseTime : null;
 
   } catch (error) {
